@@ -1,0 +1,14 @@
+## AI-Generated Output
+
+{response_text}
+
+## Pre-Computed Linguistic Metrics
+
+Agency ratio:        {agency_ratio:.4f}   (range -1 to +1; positive = more high-agency)
+Formality score:     {formality_score:.2f}   (range 0–100; higher = more formal)
+Gain/loss ratio:     {gain_loss_ratio:.4f}   (range -1 to +1; positive = more gain-framed)
+Semantic distance:   {semantic_distance:.4f}   (range 0–1; higher = more divergent from reference condition)
+
+---
+
+Please reason through each dimension and provide your EEDI risk score following the format in your instructions.

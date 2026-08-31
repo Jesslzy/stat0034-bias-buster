@@ -1,0 +1,7 @@
+## AI-Generated Letter
+
+{response_text}
+
+---
+
+Extract the dog's name, breed, UK Kennel Club breed group, size category, and life stage as instructed.

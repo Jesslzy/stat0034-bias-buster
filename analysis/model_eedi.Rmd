@@ -1,0 +1,1049 @@
+---
+title: "Bias Busters — EEDI Mixed-Effects Analysis"
+subtitle: "Statistical Modelling for Research Objectives 1–6"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Setup
+
+```{r packages}
+# Run once if required:
+# install.packages(c("readr", "dplyr", "lme4", "lmerTest", "ordinal", "emmeans", "performance", "see", "broom.mixed"))
+
+library(readr)
+library(dplyr)
+library(lme4)
+library(lmerTest)    # adds Satterthwaite p-values to lmer() output
+library(ordinal)     # clm()/clmm() for the ordinal EEDI score
+library(emmeans)
+library(performance) # r2() for marginal/conditional R^2 on mixed models
+library(see)         # diagnostic plots returned by performance
+library(broom.mixed)
+```
+
+## Data
+
+```{r load-data}
+DATA_PATH <- "../data/judged_outputs_final.csv"
+
+df <- read_csv(DATA_PATH, show_col_types = FALSE)
+
+REQUIRED_COLUMNS <- c(
+  "stage", "gender", "age_group", "tenure", "platform", "condition_id",
+  "agency_ratio", "formality_score", "gain_loss_ratio",
+  "semantic_distance", "eedi_score"
+)
+missing_columns <- setdiff(REQUIRED_COLUMNS, names(df))
+if (length(missing_columns) > 0L) {
+  stop("Missing required columns: ", paste(missing_columns, collapse = ", "))
+}
+
+# Set and validate the reference category for a variable.
+relevel_checked <- function(x, reference, variable) {
+  x <- factor(x)
+  if (!reference %in% levels(x)) {
+    stop(sprintf("Reference level '%s' is absent from %s.", reference, variable))
+  }
+  relevel(x, ref = reference)
+}
+
+# Match the reference condition used elsewhere in the pipeline.
+df <- df %>%
+  mutate(
+    gender = relevel_checked(gender, "female", "gender"),
+    age_group = relevel_checked(age_group, "55-64", "age_group"),
+    platform = relevel_checked(platform, "gpt", "platform"),
+    condition_id = factor(condition_id)
+  )
+
+stage1 <- df %>% filter(stage == "stage1")
+stage2 <- df %>% filter(stage == "stage2")
+
+stage2 <- stage2 %>%
+  mutate(
+    tenure = relevel_checked(
+      tenure, "long-term high-value supporter", "Stage 2 tenure"
+    )
+  )
+
+if (nrow(stage1) == 0L || nrow(stage2) == 0L) {
+  stop("Both Stage 1 and Stage 2 must contain at least one row.")
+}
+
+METRICS <- c(
+  "agency_ratio", "formality_score", "gain_loss_ratio", "semantic_distance"
+)
+
+# Candidate terms for model selection.
+STAGE1_CANDIDATES <- tribble(
+  ~term,
+  "platform",
+  "gender",
+  "age_group",
+  "gender:platform",
+  "age_group:platform",
+  "gender:age_group",
+  "gender:age_group:platform"
+)
+
+STAGE2_CANDIDATES <- tribble(
+  ~term,
+  "platform",
+  "gender",
+  "age_group",
+  "tenure",
+  "gender:platform",
+  "age_group:platform",
+  "gender:age_group",
+  "gender:tenure",
+  "age_group:tenure",
+  "platform:tenure",
+  "gender:platform:tenure",
+  "age_group:platform:tenure"
+)
+
+STAGE1_FULL_RHS <- paste(STAGE1_CANDIDATES$term, collapse = " + ")
+STAGE2_FULL_RHS <- paste(STAGE2_CANDIDATES$term, collapse = " + ")
+
+cat(sprintf("Stage 1: %d rows | Stage 2: %d rows\n", nrow(stage1), nrow(stage2)))
+```
+
+## Helper functions
+
+```{r helpers}
+# Print a clear heading for one linguistic metric.
+metric_header <- function(m, suffix = NULL) {
+  cat("\n====================", m, suffix, "====================\n")
+}
+
+# Print a heading for a set of BH-adjusted results.
+bh_header <- function(label = "p-values") {
+  cat(sprintf("\n==== BH-adjusted %s across all four metrics ====\n", label))
+}
+
+# Convert a drop-one table into a standard candidate-history table.
+standardise_drop_table <- function(table, metric, step,
+                                   removed_term = NULL,
+                                   denominator_df = NULL) {
+  result <- as.data.frame(table) %>%
+    tibble::rownames_to_column("candidate_term") %>%
+    filter(candidate_term != "<none>")
+  if (nrow(result) == 0L) {
+    return(tibble(
+      metric = character(), step = integer(), candidate_term = character(),
+      statistic = numeric(), df1 = numeric(), df2 = numeric(),
+      p.value = numeric(), removed = logical()
+    ))
+  }
+  p_column <- grep("^Pr\\(", names(result), value = TRUE)
+  f_column <- intersect(c("F value", "F-value"), names(result))
+  numdf_column <- intersect(c("NumDF", "Df"), names(result))
+  dendf_column <- intersect(c("DenDF"), names(result))
+  if (length(p_column) != 1L) {
+    stop("Expected exactly one p-value column in the drop-one table.")
+  }
+  if (length(f_column) != 1L) {
+    stop("Expected exactly one F-statistic column in the drop-one table.")
+  }
+  if (length(numdf_column) != 1L) {
+    stop("Expected exactly one numerator degrees-of-freedom column.")
+  }
+  if (length(dendf_column) == 1L) {
+    df2 <- result[[dendf_column]]
+  } else if (!is.null(denominator_df)) {
+    df2 <- rep(denominator_df, nrow(result))
+  } else {
+    stop("Expected denominator degrees of freedom in the drop-one table.")
+  }
+  if (anyNA(result[[p_column]])) {
+    stop("The drop-one table contains a missing p-value.")
+  }
+  tibble(
+    metric = metric,
+    step = step,
+    candidate_term = result$candidate_term,
+    statistic = result[[f_column]],
+    df1 = result[[numdf_column]],
+    df2 = df2,
+    p.value = result[[p_column]],
+    removed = if (is.null(removed_term)) {
+      rep(FALSE, nrow(result))
+    } else {
+      result$candidate_term == removed_term
+    }
+  )
+}
+
+# Reconstruct every mixed-model fixed-effect elimination step.
+mixed_fixed_history <- function(initial_model, step_table, metric, analysis_data) {
+  elimination <- as.data.frame(step_table) %>%
+    tibble::rownames_to_column("candidate_term") %>%
+    filter(Eliminated > 0L) %>%
+    arrange(Eliminated)
+  current_model <- initial_model
+  history <- list()
+  models <- list(step0 = current_model)
+  step_number <- 1L
+
+  for (term in elimination$candidate_term) {
+    tests <- drop1(current_model, ddf = "Satterthwaite")
+    history[[step_number]] <- standardise_drop_table(
+      tests, metric, step_number, term
+    )
+    current_model <- update(
+      current_model,
+      as.formula(paste(". ~ . -", term)),
+      data = analysis_data
+    )
+    models[[paste0("step", step_number)]] <- current_model
+    step_number <- step_number + 1L
+  }
+
+  final_tests <- drop1(current_model, ddf = "Satterthwaite")
+  history[[step_number]] <- standardise_drop_table(
+    final_tests, metric, step_number
+  )
+  list(history = bind_rows(history), models = models, final_model = current_model)
+}
+
+# Perform backward elimination for an ordinary linear model.
+backward_ols <- function(metric, full_rhs, analysis_data, alpha = 0.05) {
+  current_model <- lm(
+    as.formula(paste(metric, "~", full_rhs)),
+    data = analysis_data
+  )
+  history <- list()
+  models <- list(step0 = current_model)
+  step_number <- 1L
+
+  repeat {
+    tests <- drop1(current_model, test = "F")
+    standard <- standardise_drop_table(
+      tests,
+      metric,
+      step_number,
+      denominator_df = df.residual(current_model)
+    )
+    removable <- standard %>% filter(p.value > alpha)
+    if (nrow(removable) == 0L) {
+      history[[step_number]] <- standard
+      break
+    }
+    removed_term <- removable$candidate_term[[which.max(removable$p.value)]]
+    standard$removed[standard$candidate_term == removed_term] <- TRUE
+    history[[step_number]] <- standard
+    current_model <- update(
+      current_model,
+      as.formula(paste(". ~ . -", removed_term))
+    )
+    models[[paste0("step", step_number)]] <- current_model
+    step_number <- step_number + 1L
+  }
+  list(history = bind_rows(history), models = models, final_model = current_model)
+}
+
+# Convert a random-effect test into a step-history table.
+standardise_random_table <- function(table, step, removed_term = NULL) {
+  as.data.frame(table) %>%
+    tibble::rownames_to_column("random_term") %>%
+    filter(random_term != "<none>") %>%
+    mutate(
+      step = step,
+      removed = if (is.null(removed_term)) {
+        FALSE
+      } else {
+        random_term == removed_term
+      },
+      .before = 1L
+    )
+}
+
+# Extract one likelihood-ratio comparison between nested mixed models.
+random_lrt_row <- function(reduced_model, full_model, removed_term) {
+  comparison <- anova(reduced_model, full_model, refit = FALSE)
+  p_column <- grep("^Pr\\(", names(comparison), value = TRUE)
+  df_column <- intersect(c("Df", "Chi Df"), names(comparison))
+  if (length(p_column) != 1L || length(df_column) != 1L) {
+    stop("Unexpected likelihood-ratio comparison table.")
+  }
+  tibble(
+    random_term = removed_term,
+    npar = comparison$npar[[2L]],
+    logLik = comparison$logLik[[2L]],
+    AIC = comparison$AIC[[2L]],
+    LRT = comparison$Chisq[[2L]],
+    Df = comparison[[df_column]][[2L]],
+    `Pr(>Chisq)` = comparison[[p_column]][[2L]]
+  )
+}
+
+# Compare the three candidate random-effects structures using LRTs.
+select_random_structure <- function(metric, full_rhs, analysis_data,
+                                    alpha = 0.10) {
+  random_structures <- c(
+    full = "(1 | condition_id) + (1 | condition_id:platform)",
+    condition = "(1 | condition_id)",
+    condition_platform = "(1 | condition_id:platform)"
+  )
+  models <- lapply(random_structures, function(random_rhs) {
+    lmer(
+      as.formula(paste(metric, "~", full_rhs, "+", random_rhs)),
+      data = analysis_data,
+      REML = TRUE
+    )
+  })
+
+  candidates <- bind_rows(
+    random_lrt_row(
+      models$condition,
+      models$full,
+      "(1 | condition_id:platform)"
+    ),
+    random_lrt_row(
+      models$condition_platform,
+      models$full,
+      "(1 | condition_id)"
+    )
+  )
+  p_column <- "Pr(>Chisq)"
+  removable <- which(candidates[[p_column]] > alpha)
+  if (length(removable) == 0L) {
+    return(list(
+      full_model = models$full,
+      selected_model = models$full,
+      history = candidates %>% mutate(step = 1L, removed = FALSE, .before = 1L)
+    ))
+  }
+
+  remove_index <- removable[[which.max(candidates[[p_column]][removable])]]
+  removed_term <- candidates$random_term[[remove_index]]
+  selected_name <- if (grepl("condition_id:platform", removed_term)) {
+    "condition"
+  } else {
+    "condition_platform"
+  }
+  selected_model <- models[[selected_name]]
+  history <- list(
+    candidates %>%
+      mutate(
+        step = 1L,
+        removed = random_term == removed_term,
+        .before = 1L
+      )
+  )
+
+  remaining_test <- lmerTest::ranova(selected_model, reduce.terms = TRUE)
+  remaining_candidate <- remaining_test[-1L, , drop = FALSE]
+  remaining_p <- remaining_candidate[[p_column]][[1L]]
+  remaining_term <- rownames(remaining_candidate)[[1L]]
+  remove_remaining <- remaining_p > alpha
+  history[[2L]] <- standardise_random_table(
+    remaining_test,
+    2L,
+    if (remove_remaining) remaining_term else NULL
+  )
+
+  list(
+    full_model = models$full,
+    selected_model = if (remove_remaining) NULL else selected_model,
+    history = bind_rows(history)
+  )
+}
+
+# Simplify random effects, then fixed effects, for one metric.
+backward_select_metric <- function(metric, full_rhs, analysis_data,
+                                   alpha_random = 0.10,
+                                   alpha_fixed = 0.05) {
+  random_result <- select_random_structure(
+    metric, full_rhs, analysis_data, alpha_random
+  )
+  full_model <- random_result$full_model
+  random_model <- random_result$selected_model
+  use_ols <- is.null(random_model) ||
+    isSingular(random_model)
+
+  if (use_ols) {
+    fixed_result <- backward_ols(metric, full_rhs, analysis_data, alpha_fixed)
+    final_model <- fixed_result$final_model
+    fixed_step <- NULL
+  } else {
+    fixed_step <- lmerTest::step(
+      random_model,
+      reduce.random = FALSE,
+      reduce.fixed = TRUE,
+      alpha.fixed = alpha_fixed,
+      ddf = "Satterthwaite"
+    )
+    reconstructed <- mixed_fixed_history(
+      random_model,
+      fixed_step$fixed,
+      metric,
+      analysis_data
+    )
+    final_model <- lmerTest::get_model(fixed_step)
+    fixed_result <- reconstructed
+    if (isSingular(final_model)) {
+      use_ols <- TRUE
+      fixed_result <- backward_ols(metric, full_rhs, analysis_data, alpha_fixed)
+      final_model <- fixed_result$final_model
+      fixed_step <- NULL
+    }
+  }
+
+  final_terms <- attr(terms(final_model), "term.labels")
+  final_rhs <- if (length(final_terms) == 0L) "1" else paste(final_terms, collapse = " + ")
+
+  list(
+    metric = metric,
+    full_model = full_model,
+    random_history = random_result$history,
+    random_model = random_model,
+    fixed_step = fixed_step,
+    history = fixed_result$history,
+    models = fixed_result$models,
+    final_model = final_model,
+    model_type = if (use_ols) "OLS" else "mixed",
+    final_rhs = final_rhs
+  )
+}
+
+# Run one metric-level backward-elimination job.
+run_backward_metric_job <- function(metric, full_rhs, analysis_data) {
+  backward_select_metric(metric, full_rhs, analysis_data)
+}
+
+# Run backward elimination in parallel across linguistic metrics.
+run_backward_selection <- function(full_rhs, analysis_data, metrics) {
+  detected <- parallel::detectCores(logical = FALSE)
+  if (is.na(detected)) detected <- 1L
+  workers <- min(length(metrics), max(1L, detected - 1L))
+  cat(sprintf(
+    "Running %d backward selections with %d worker(s).\n",
+    length(metrics), workers
+  ))
+  cluster <- parallel::makeCluster(workers)
+  on.exit(parallel::stopCluster(cluster), add = TRUE)
+  invisible(parallel::clusterEvalQ(cluster, {
+    library(dplyr)
+    library(lme4)
+    library(lmerTest)
+  }))
+  parallel::clusterExport(
+    cluster,
+    c(
+      "standardise_drop_table",
+      "mixed_fixed_history", "standardise_random_table",
+      "random_lrt_row", "select_random_structure",
+      "backward_ols", "backward_select_metric", "run_backward_metric_job"
+    ),
+    envir = environment()
+  )
+  results <- parallel::parLapply(
+    cluster, metrics, run_backward_metric_job, full_rhs, analysis_data
+  )
+  setNames(results, metrics)
+}
+
+# Combine complete fixed-effect elimination histories.
+backward_history_table <- function(selection_results) {
+  bind_rows(lapply(selection_results, `[[`, "history")) %>%
+    arrange(metric, step, desc(p.value))
+}
+
+# Summarise the term removed at every successful step.
+backward_path_table <- function(selection_results) {
+  backward_history_table(selection_results) %>% filter(removed)
+}
+
+# Extract final fitted models.
+backward_final_models <- function(selection_results) {
+  setNames(lapply(selection_results, `[[`, "final_model"), names(selection_results))
+}
+
+# Combine random-effect elimination histories across metrics.
+random_elimination_table <- function(selection_results) {
+  bind_rows(lapply(selection_results, function(result) {
+    result$random_history %>%
+      mutate(metric = result$metric, .before = 1L)
+  }))
+}
+
+# Summarise the change in explained variance after each term is removed.
+backward_contribution_table <- function(selection_results) {
+  bind_rows(lapply(selection_results, function(result) {
+    path <- result$history %>% filter(removed) %>% arrange(step)
+    if (nrow(path) == 0L) return(tibble())
+    bind_rows(lapply(seq_len(nrow(path)), function(i) {
+      before <- model_r2(result$models[[i]])[["marginal"]]
+      after <- model_r2(result$models[[i + 1L]])[["marginal"]]
+      path[i, ] %>%
+        transmute(
+          metric,
+          step,
+          removed_term = candidate_term,
+          R2_before = before,
+          R2_after = after,
+          delta_R2 = after - before,
+          statistic,
+          df1,
+          df2,
+          p.value
+        )
+    }))
+  }))
+}
+
+# Print the summary for every metric model.
+print_model_summaries <- function(models) {
+  for (m in names(models)) {
+    metric_header(m)
+    print(summary(models[[m]]))
+  }
+}
+
+# Plot residual diagnostics for each selected model.
+plot_model_diagnostics <- function(models) {
+  for (metric in names(models)) {
+    model <- models[[metric]]
+    model_type <- if (inherits(model, "merMod")) "mixed-model" else "OLS"
+    metric_header(metric, paste0(" ", model_type, " diagnostics"))
+    print(performance::check_model(model))
+  }
+}
+
+# Apply BH correction and add conventional significance symbols.
+add_bh_sig <- function(df, p_col = "p.value") {
+  if (!p_col %in% names(df)) {
+    stop(sprintf("Column '%s' is required for BH correction.", p_col))
+  }
+  df %>%
+    mutate(
+      p_adj_BH = p.adjust(.data[[p_col]], method = "BH"),
+      sig = as.character(
+        symnum(
+          p_adj_BH,
+          corr = FALSE,
+          na = FALSE,
+          cutpoints = c(0, .001, .01, .05, .1, 1),
+          symbols = c("***", "**", "*", ".", " ")
+        )
+      )
+    )
+}
+
+# Extract marginal and conditional R-squared values where available.
+model_r2 <- function(model) {
+  if (!inherits(model, "merMod")) {
+    return(c(marginal = summary(model)$r.squared, conditional = NA_real_))
+  }
+
+  result <- performance::r2(model)
+  c(
+    marginal = as.numeric(result$R2_marginal[[1L]]),
+    conditional = as.numeric(result$R2_conditional[[1L]])
+  )
+}
+
+# Collect unadjusted contrasts.
+collect_simple_effects <- function(models, spec, ...) {
+  required_variables <- all.vars(spec)
+  eligible_models <- models[vapply(models, function(model) {
+    all(required_variables %in% all.vars(formula(model)))
+  }, logical(1))]
+  if (length(eligible_models) == 0L) {
+    return(tibble(
+      metric = character(),
+      platform = character(),
+      contrast = character(),
+      estimate = numeric(),
+      SE = numeric(),
+      lower.CL = numeric(),
+      upper.CL = numeric(),
+      p.value = numeric()
+    ))
+  }
+
+  bind_rows(lapply(names(eligible_models), function(m) {
+    emmeans(eligible_models[[m]], spec, ...) %>%
+      pairs(adjust = "none") %>%
+      summary(infer = c(TRUE, TRUE)) %>%
+      as.data.frame() %>%
+      mutate(metric = m)
+  }))
+}
+
+# Collect fixed-effect coefficient estimates across metrics.
+tidy_fixed_effects <- function(models) {
+  bind_rows(lapply(names(models), function(m) {
+    model <- models[[m]]
+    tidy_result <- if (inherits(model, "merMod")) {
+      broom.mixed::tidy(model, effects = "fixed")
+    } else {
+      broom.mixed::tidy(model)
+    }
+    tidy_result %>% mutate(metric = m)
+  }))
+}
+
+# Collect omnibus term tests.
+joint_test_table <- function(models) {
+  bind_rows(lapply(names(models), function(m) {
+    as.data.frame(joint_tests(models[[m]])) %>%
+      rename(term = `model term`) %>%
+      mutate(metric = m)
+  }))
+}
+
+# Sort and rejoin the variables in one model term.
+sort_model_term <- function(parts) {
+  paste(sort(parts), collapse = ":")
+}
+
+# Standardise interaction terms so their variable order does not affect matching.
+canonical_model_term <- function(term) {
+  vapply(
+    strsplit(term, ":", fixed = TRUE),
+    sort_model_term,
+    character(1)
+  )
+}
+
+# Retain models with a significant BH-adjusted joint test for one term.
+models_for_follow_up <- function(models, joint_results, term_name) {
+  target_term <- canonical_model_term(term_name)
+  eligible_metrics <- joint_results %>%
+    filter(
+      canonical_model_term(term) == target_term,
+      p_adj_BH < 0.05
+    ) %>%
+    pull(metric)
+  models[intersect(names(models), eligible_metrics)]
+}
+
+# Print the significance-symbol key.
+sig_legend <- function() cat("Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1\n")
+
+# Print every row and column of a result table.
+print_all_rows <- function(data) {
+  data %>%
+    as_tibble() %>%
+    print(n = Inf, width = Inf)
+}
+```
+
+## Backward Elimination -- Stage 1
+
+Simplify random effects first, followed by fixed effects.
+
+```{r stage1-backward-elimination, cache=TRUE}
+stage1_backward <- run_backward_selection(STAGE1_FULL_RHS, stage1, METRICS)
+stage1_backward_path <- backward_path_table(stage1_backward)
+stage1_backward_history <- backward_history_table(stage1_backward)
+
+print_all_rows(stage1_backward_path)
+print_all_rows(stage1_backward_history)
+print_all_rows(random_elimination_table(stage1_backward))
+```
+
+Use the final Stage 1 model for each linguistic measure.
+
+```{r stage1-final-models}
+stage1_models <- backward_final_models(stage1_backward)
+print(setNames(lapply(stage1_backward, `[[`, "final_rhs"), METRICS))
+print(setNames(lapply(stage1_backward, `[[`, "model_type"), METRICS))
+```
+
+```{r stage1-results}
+print_model_summaries(stage1_models)
+```
+
+Check the residual assumptions of each selected model.
+
+```{r stage1-model-diagnostics, fig.width=12, fig.height=12}
+plot_model_diagnostics(stage1_models)
+```
+
+BH family: all non-intercept coefficients across the four metrics.
+
+```{r stage1-results-BH}
+stage1_coefs <- tidy_fixed_effects(stage1_models) %>%
+  filter(term != "(Intercept)") %>%
+  add_bh_sig("p.value")
+
+bh_header()
+print_all_rows(
+  stage1_coefs %>% select(metric, term, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+The following omnibus tests assess complete model terms.
+
+```{r stage1-joint-tests}
+stage1_joint <- joint_test_table(stage1_models) %>% add_bh_sig("p.value")
+
+bh_header("omnibus term p-values")
+print_all_rows(
+  stage1_joint %>%
+    select(metric, term, df1, df2, F.ratio, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+Report platform-specific and equally weighted platform-averaged contrasts.
+
+```{r objective1-gender-within-platform}
+gender_by_platform <- collect_simple_effects(
+  models_for_follow_up(stage1_models, stage1_joint, "gender:platform"),
+  ~ gender | platform,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("gender-within-platform contrast p-values")
+print_all_rows(
+  gender_by_platform %>%
+    select(metric, platform, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r objective1-age-within-platform}
+age_by_platform <- collect_simple_effects(
+  models_for_follow_up(stage1_models, stage1_joint, "age_group:platform"),
+  ~ age_group | platform,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("age_group-within-platform contrast p-values")
+print_all_rows(
+  age_by_platform %>%
+    select(metric, platform, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r objective1-gender-averaged}
+gender_averaged <- collect_simple_effects(
+  models_for_follow_up(stage1_models, stage1_joint, "gender"),
+  ~ gender,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("platform-averaged gender contrast p-values")
+print_all_rows(
+  gender_averaged %>%
+    select(metric, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r objective1-age-averaged}
+age_averaged <- collect_simple_effects(
+  models_for_follow_up(stage1_models, stage1_joint, "age_group"),
+  ~ age_group,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("platform-averaged age_group contrast p-values")
+print_all_rows(
+  age_averaged %>%
+    select(metric, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+## Backward Elimination -- Stage 2
+
+Simplify random effects first, followed by fixed effects.
+
+```{r stage2-backward-elimination, cache=TRUE}
+stage2_backward <- run_backward_selection(STAGE2_FULL_RHS, stage2, METRICS)
+stage2_backward_path <- backward_path_table(stage2_backward)
+stage2_backward_history <- backward_history_table(stage2_backward)
+
+print_all_rows(stage2_backward_path)
+print_all_rows(stage2_backward_history)
+print_all_rows(random_elimination_table(stage2_backward))
+```
+
+Use the final Stage 2 model for each linguistic measure.
+
+```{r stage2-final-models}
+stage2_models <- backward_final_models(stage2_backward)
+print(setNames(lapply(stage2_backward, `[[`, "final_rhs"), METRICS))
+print(setNames(lapply(stage2_backward, `[[`, "model_type"), METRICS))
+```
+
+```{r stage2-results}
+print_model_summaries(stage2_models)
+```
+
+Check the residual assumptions of each selected model.
+
+```{r stage2-model-diagnostics, fig.width=12, fig.height=12}
+plot_model_diagnostics(stage2_models)
+```
+
+BH family: all non-intercept coefficients across the four metrics.
+
+```{r stage2-results-BH}
+stage2_coefs <- tidy_fixed_effects(stage2_models) %>%
+  filter(term != "(Intercept)") %>%
+  add_bh_sig("p.value")
+
+bh_header()
+print_all_rows(
+  stage2_coefs %>% select(metric, term, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+Export the elimination paths, final formulae, and complete candidate histories.
+
+```{r export-backward-selection-results}
+SELECTION_OUTPUT_DIR <- "backward_selection_outputs"
+dir.create(SELECTION_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+final_formulas <- bind_rows(
+  tibble(
+    stage = "Stage 1",
+    metric = METRICS,
+    final_formula = vapply(stage1_backward, `[[`, character(1), "final_rhs")
+  ),
+  tibble(
+    stage = "Stage 2",
+    metric = METRICS,
+    final_formula = vapply(stage2_backward, `[[`, character(1), "final_rhs")
+  )
+)
+
+write_csv(stage1_backward_path, file.path(SELECTION_OUTPUT_DIR, "stage1_elimination_path.csv"))
+write_csv(stage2_backward_path, file.path(SELECTION_OUTPUT_DIR, "stage2_elimination_path.csv"))
+write_csv(stage1_backward_history, file.path(SELECTION_OUTPUT_DIR, "stage1_candidate_history.csv"))
+write_csv(stage2_backward_history, file.path(SELECTION_OUTPUT_DIR, "stage2_candidate_history.csv"))
+write_csv(final_formulas, file.path(SELECTION_OUTPUT_DIR, "final_formulas.csv"))
+write_csv(stage1_coefs, file.path(SELECTION_OUTPUT_DIR, "stage1_final_coefficients.csv"))
+write_csv(stage2_coefs, file.path(SELECTION_OUTPUT_DIR, "stage2_final_coefficients.csv"))
+```
+
+Omnibus tests for the final selected models:
+
+```{r stage2-joint-tests}
+stage2_joint <- joint_test_table(stage2_models) %>% add_bh_sig("p.value")
+
+bh_header("omnibus term p-values")
+print_all_rows(
+  stage2_joint %>%
+    select(metric, term, df1, df2, F.ratio, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+Equally weighted demographic contrasts:
+
+```{r stage2-gender-averaged}
+stage2_gender_averaged <- collect_simple_effects(
+  models_for_follow_up(stage2_models, stage2_joint, "gender"),
+  ~ gender,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("Stage 2 platform-and-tenure-averaged gender contrast p-values")
+print_all_rows(
+  stage2_gender_averaged %>%
+    select(metric, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r stage2-age-averaged}
+stage2_age_averaged <- collect_simple_effects(
+  models_for_follow_up(stage2_models, stage2_joint, "age_group"),
+  ~ age_group,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("Stage 2 platform-and-tenure-averaged age-group contrast p-values")
+print_all_rows(
+  stage2_age_averaged %>%
+    select(metric, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+Platform-specific demographic contrasts:
+
+```{r stage2-gender-within-platform}
+stage2_gender_within_platform <- collect_simple_effects(
+  models_for_follow_up(stage2_models, stage2_joint, "gender:platform"),
+  ~ gender | platform,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("Stage 2 gender-within-platform contrast p-values")
+print_all_rows(
+  stage2_gender_within_platform %>%
+    select(metric, platform, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r stage2-age-within-platform}
+stage2_age_within_platform <- collect_simple_effects(
+  models_for_follow_up(stage2_models, stage2_joint, "age_group:platform"),
+  ~ age_group | platform,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("Stage 2 age-group-within-platform contrast p-values")
+print_all_rows(
+  stage2_age_within_platform %>%
+    select(metric, platform, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r stage2-age-within-platform-tenure}
+stage2_age_within_platform_tenure <- collect_simple_effects(
+  models_for_follow_up(
+    stage2_models,
+    stage2_joint,
+    "platform:age_group:tenure"
+  ),
+  ~ age_group | platform * tenure,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("Stage 2 age-group-within-platform-and-tenure contrast p-values")
+print_all_rows(
+  stage2_age_within_platform_tenure %>%
+    select(
+      metric, platform, tenure, contrast, estimate, SE,
+      lower.CL, upper.CL, p.value, p_adj_BH, sig
+    )
+)
+sig_legend()
+```
+
+Overall and platform-specific tenure contrasts:
+
+```{r stage2-tenure-averaged}
+tenure_averaged <- collect_simple_effects(
+  models_for_follow_up(stage2_models, stage2_joint, "tenure"),
+  ~ tenure,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("platform-averaged tenure contrast p-values")
+print_all_rows(
+  tenure_averaged %>%
+    select(metric, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+```{r stage2-tenure-within-platform}
+tenure_within_platform <- collect_simple_effects(
+  models_for_follow_up(stage2_models, stage2_joint, "platform:tenure"),
+  ~ tenure | platform,
+  weights = "equal"
+) %>% add_bh_sig("p.value")
+
+bh_header("tenure-within-platform contrast p-values")
+print_all_rows(
+  tenure_within_platform %>%
+    select(metric, platform, contrast, estimate, SE, lower.CL, upper.CL, p.value, p_adj_BH, sig)
+)
+sig_legend()
+```
+
+## Objective 3 — Supporter tenure and demographic variation
+
+The selection histories show whether tenure and its eligible interactions
+improved each model. Conditional contrasts are produced only for interactions
+retained in a final model.
+
+## Objective 4 — Relative explanatory contributions
+
+Summarise the change associated with each term removed from the Stage 2 models.
+
+```{r objective4-backward-contributions}
+stage2_backward_contributions <- backward_contribution_table(stage2_backward)
+print_all_rows(stage2_backward_contributions)
+```
+
+## Objective 6 — GPT-focused within-between decomposition
+
+```{r objective6-gpt-data}
+gpt_data <- df %>% filter(platform == "gpt")
+cat(sprintf(
+  "GPT-focused EEDI corpus: %d rows (%d stage1 + %d stage2)\n",
+  nrow(gpt_data), sum(gpt_data$stage == "stage1"), sum(gpt_data$stage == "stage2")
+))
+
+# Standardise metrics before decomposition.
+gpt_data <- gpt_data %>%
+  mutate(
+    z_agency       = as.numeric(scale(agency_ratio)),
+    z_formality    = as.numeric(scale(formality_score)),
+    z_gainloss     = as.numeric(scale(gain_loss_ratio)),
+    z_semdist      = as.numeric(scale(semantic_distance)),
+    eedi_score_ord = factor(eedi_score, levels = 1:5, ordered = TRUE)
+  )
+```
+
+Fit the GPT-focused within--between cumulative link mixed model.
+
+```{r objective6-model, cache=TRUE}
+gpt_decomp <- gpt_data %>%
+  group_by(condition_id) %>%
+  mutate(
+    agency_between    = mean(z_agency, na.rm = TRUE),
+    agency_within     = z_agency - agency_between,
+    formality_between = mean(z_formality, na.rm = TRUE),
+    formality_within  = z_formality - formality_between,
+    gainloss_between  = mean(z_gainloss, na.rm = TRUE),
+    gainloss_within   = z_gainloss - gainloss_between,
+    semdist_between   = mean(z_semdist, na.rm = TRUE),
+    semdist_within    = z_semdist - semdist_between
+  ) %>%
+  ungroup()
+
+step1_model <- clmm(
+  eedi_score_ord ~ agency_within + agency_between +
+    formality_within + formality_between +
+    gainloss_within + gainloss_between +
+    semdist_within + semdist_between +
+    (1 | condition_id),
+  data = gpt_decomp, link = "logit", Hess = TRUE
+)
+summary(step1_model)
+```
+
+Check collinearity and approximate the proportional-odds diagnostic using the
+equivalent non-mixed model.
+
+```{r objective6-diagnostics}
+collinearity_result <- performance::check_collinearity(step1_model)
+print(collinearity_result)
+
+step1_clm_check <- clm(
+  eedi_score_ord ~ agency_within + agency_between +
+    formality_within + formality_between +
+    gainloss_within + gainloss_between +
+    semdist_within + semdist_between,
+  data = gpt_decomp, link = "logit"
+)
+po_test <- nominal_test(step1_clm_check)
+cat("\nProportional-odds check (approximate, via non-mixed clm):\n")
+print(po_test)
+
+```

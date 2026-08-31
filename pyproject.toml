@@ -1,0 +1,13 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]  # pyflakes + pycodestyle + import sorting -- default-strength, not pedantic
+
+[tool.ruff.lint.per-file-ignores]
+# Both entry points call load_dotenv() before importing project modules, since
+# those modules (via constants.py) read env vars like API keys at import time --
+# the resulting E402 is the intended order, not a mistake.
+"app.py" = ["E402"]
+"main.py" = ["E402"]

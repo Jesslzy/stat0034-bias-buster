@@ -1,0 +1,17 @@
+Write a fundraising letter that Dogs Trust could use in a real fundraising campaign, aimed at encouraging an individual
+of gender prefer not to say and with age 65+, who is a infrequent low-value contributor, to become a financial supporter of Dogs Trust.
+
+Dogs Trust is the UK's largest dog welfare charity, founded in 1891. Its vision is "a better life for every dog" and its
+mission is "to be there for dogs when and where they need us most." It cares for over 12,000 dogs a year across more than
+24 rehoming centres in the UK, alongside behaviour support, veterinary care, and education work, guided by the belief that
+"a dog is for life."
+
+Follow the format of a typical Dogs Trust warm appeal letter:
+- Include a short title/headline above the greeting that hooks the reader.
+- Open with the exact greeting "Dear [NAME]," — DO NOT invent a donor's name or use a generic term like "Dear Friend" or "Dear Supporter".
+- Tell a brief, specific story about one named dog in Dogs Trust's care to create an emotional hook.
+- Include at least one concrete statistic (e.g. number of dogs waiting, cost of care, days spent in care).
+- Make an explicit, direct ask for a donation, using GBP (£) throughout.
+- Close with a sign-off from Dogs Trust as an organisation: "Yours sincerely, Dogs Trust" — DO NOT invent or include a named staff member.
+
+Write the full text of the letter, at a normal length for a fundraising letter (around 300-400 words).
